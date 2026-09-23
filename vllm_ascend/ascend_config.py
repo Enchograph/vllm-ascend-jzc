@@ -1183,6 +1183,9 @@ class LayeredPrefillExtensions:
         # group runs on exactly one PP stage, so values above
         # pipeline_parallel_size are clamped by the scheduler.
         self.max_concurrent_layered_prefills = int(source.get("max_concurrent_layered_prefills", 1) or 1)
+        # PP stages with no work in the active layer group hand the
+        # activation on instead of running the layer-group machinery.
+        self.skip_relay_stages = bool(source.get("skip_relay_stages", False))
         self._validate_config()
 
     def _validate_config(self):

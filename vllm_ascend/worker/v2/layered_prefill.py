@@ -28,6 +28,14 @@ def empty_layered_prefill_counters() -> dict[str, Any]:
         "transport_frontier_steps": 0,
         "fused_mixed_steps": 0,
         "same_layer_steps": 0,
+        # skip_relay_stages: steps this rank handed on without running the
+        # layer group.  "empty" sent a zero-row placeholder (ahead of the
+        # group owner), "forward" passed the received activation through
+        # (behind it).  A smoke probe needs a positive signal that the skip
+        # engaged; "no speedup" and "silently never fired" look identical
+        # otherwise.
+        "relay_empty_steps": 0,
+        "relay_forward_steps": 0,
         "groups": [],
         "pp_slots": [],
         "activation_sources": [],

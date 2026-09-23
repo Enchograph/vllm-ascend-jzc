@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.sequence import IntermediateTensors
@@ -698,3 +699,318 @@ def test_record_layered_activation_counts_transport_frontier(monkeypatch):
     snap = runner.layered_prefill_snapshot()
     assert snap["transport_frontier_steps"] == 1
     assert snap["pp_rank"] == 0
+
+
+def test_fused_pp_payload_drops_rows_before_the_group_owner(monkeypatch):
+    """Stages ahead of the group owner ship a placeholder nobody reads."""
+    partitions = {0: (0, 12), 1: (12, 24), 2: (24, 36), 3: (36, 48)}
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.model_runner.get_pp_indices",
+        lambda _n, rank, _world: partitions[rank],
+    )
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(num_hidden_layers=48),
+        hf_config=None,
+    )
+    output = SimpleNamespace(
+        hidden_states=torch.ones(7, 4), residual=torch.ones(7, 4)
+    )
+    runner.layered_prefill_model_adapter = SimpleNamespace(
+        to_intermediate_tensors=lambda out: IntermediateTensors(
+            {"hidden_states": out.hidden_states, "residual": out.residual}
+        )
+    )
+    # Layers [24, 36) sit on stage 2, so stages 0 and 1 only relay.
+    plan = SimpleNamespace(group_start=24, group_end=36)
+
+    for rank, expected_rows in ((0, 0), (1, 0), (2, 7), (3, 7)):
+        monkeypatch.setattr(
+            "vllm_ascend.worker.v2.model_runner.get_pp_group",
+            lambda rank=rank: SimpleNamespace(world_size=4, rank_in_group=rank),
+        )
+        packed = NPUModelRunner._layered_fused_pp_payload(runner, plan, output)
+        assert packed.tensors["hidden_states"].shape[0] == expected_rows
+        assert packed.tensors["residual"].shape[0] == expected_rows
+        # An empty tensor makes both isend_tensor_dict and irecv_tensor_dict
+        # skip the transfer, so the ring stays matched.
+        assert (packed.tensors["hidden_states"].numel() == 0) == (
+            expected_rows == 0
+        )
+
+
+def _relay_runner(*, pp_size=4, dp_size=1, enabled=True, num_layers=48):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner._skip_relay_stages = enabled
+    runner.dp_size = dp_size
+    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=pp_size)
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    runner.model_config = SimpleNamespace(
+        hf_text_config=SimpleNamespace(num_hidden_layers=num_layers),
+        hf_config=None,
+    )
+    return runner
+
+
+def _relay_plan(group_id, num_groups, start, end, *, sampling=False):
+    return SimpleNamespace(
+        group_id=group_id,
+        num_groups=num_groups,
+        group_start=start,
+        group_end=end,
+        is_sampling_step=sampling,
+        is_final_group=group_id + 1 == num_groups,
+    )
+
+
+def _patch_pp(monkeypatch, rank, *, pp_size=4, num_layers=48):
+    width = num_layers // pp_size
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.model_runner.get_pp_indices",
+        lambda _n, r, _w: (r * width, (r + 1) * width),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.worker.v2.model_runner.get_pp_group",
+        lambda: SimpleNamespace(world_size=pp_size, rank_in_group=rank),
+    )
+
+
+@pytest.mark.parametrize(
+    "rank, expected",
+    # G=4 on PP=4: group 1 is stage 1's and group 2 is stage 2's, so stage 2
+    # must run to keep the next frontier. Stage 0 is ahead, stage 3 behind.
+    [(0, "empty"), (1, None), (2, None), (3, "forward")],
+)
+def test_relay_action_spares_the_owner_and_the_next_owner(
+    monkeypatch, rank, expected
+):
+    _patch_pp(monkeypatch, rank)
+    runner = _relay_runner()
+    plan = _relay_plan(1, 4, 12, 24)
+    action = NPUModelRunner._layered_relay_stage_action(runner, plan)
+    assert action == expected
+
+
+def test_next_owner_is_spared_so_its_frontier_survives(monkeypatch):
+    """owner_of(group+1) must run: the step leaves its frontier behind."""
+    # Group 2 of 4 is stage 2's and group 3 is stage 3's.
+    _patch_pp(monkeypatch, 3)
+    runner = _relay_runner()
+    assert (
+        NPUModelRunner._layered_relay_stage_action(
+            runner, _relay_plan(2, 4, 24, 36)
+        )
+        is None
+    )
+    _patch_pp(monkeypatch, 0)
+    runner = _relay_runner()
+    assert (
+        NPUModelRunner._layered_relay_stage_action(
+            runner, _relay_plan(2, 4, 24, 36)
+        )
+        == "empty"
+    )
+
+
+def test_final_group_never_relays_even_without_sampling(monkeypatch):
+    """The final group clears the frontier on every rank; nobody may skip it.
+
+    The last group of a non-final token chunk is not a sampling step, but it
+    still runs the clear, and a rank that skipped it would carry a stale
+    frontier into the next chunk's group 0.
+    """
+    _patch_pp(monkeypatch, 0)
+    runner = _relay_runner()
+    plan = _relay_plan(3, 4, 36, 48)
+    plan.is_sampling_step = False
+    assert plan.is_final_group is True
+    assert NPUModelRunner._layered_relay_stage_action(runner, plan) is None
+
+
+def test_next_group_owner_tracks_the_stage_partition(monkeypatch):
+    _patch_pp(monkeypatch, 0)
+    runner = _relay_runner()
+    for group_id, expected in ((0, 1), (1, 2), (2, 3), (3, None)):
+        assert (
+            NPUModelRunner._layered_next_group_owner(
+                runner, _relay_plan(group_id, 4, group_id * 12, (group_id + 1) * 12)
+            )
+            == expected
+        )
+
+
+def test_sampling_step_never_relays(monkeypatch):
+    """The last rank broadcasts there; every other rank must stay to receive."""
+    _patch_pp(monkeypatch, 0)
+    runner = _relay_runner()
+    assert (
+        NPUModelRunner._layered_relay_stage_action(
+            runner, _relay_plan(3, 4, 36, 48, sampling=True)
+        )
+        is None
+    )
+    # is_final_group is the fallback when is_sampling_step is absent.
+    bare = SimpleNamespace(
+        group_id=3, num_groups=4, group_start=36, group_end=48,
+        is_final_group=True,
+    )
+    assert NPUModelRunner._layered_relay_stage_action(runner, bare) is None
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"enabled": False}, {"pp_size": 1}, {"dp_size": 2}]
+)
+def test_relay_is_gated_off(monkeypatch, kwargs):
+    """Knob off, PP=1, and DP>1 each disable the relay short-circuit."""
+    _patch_pp(monkeypatch, 0)
+    runner = _relay_runner(**kwargs)
+    assert (
+        NPUModelRunner._layered_relay_stage_action(runner, _relay_plan(1, 4, 12, 24))
+        is None
+    )
+
+
+def test_relay_is_gated_off_by_a_kv_connector(monkeypatch):
+    """With a connector the executor aggregates every rank's output."""
+    _patch_pp(monkeypatch, 0)
+    runner = _relay_runner()
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=object())
+    assert (
+        NPUModelRunner._layered_relay_stage_action(runner, _relay_plan(1, 4, 12, 24))
+        is None
+    )
+
+
+def _relay_step_runner(*, is_last=False, rank=0):
+    from vllm_ascend.worker.v2.layered_prefill import (
+        empty_layered_prefill_counters,
+    )
+
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.is_last_pp_rank = is_last
+    runner.layered_prefill_counters = empty_layered_prefill_counters()
+    return runner
+
+
+def test_relay_step_forwards_the_received_activation(monkeypatch):
+    """A stage behind the owner passes its input straight on."""
+    _patch_pp(monkeypatch, 3)
+    runner = _relay_step_runner()
+    received = IntermediateTensors({"hidden_states": torch.ones(5, 2)})
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"p0": 8, "d0": 1})
+
+    packed = NPUModelRunner._execute_layered_relay_step(
+        runner, scheduler_output, "forward", received, fused=True
+    )
+    assert packed is received
+    assert runner.execute_model_state is None
+    # sample_tokens still owes update_from_output one row per request.
+    assert runner._layered_relay_output.req_ids == ["p0", "d0"]
+    assert runner._layered_relay_output.sampled_token_ids == [[], []]
+
+
+def test_relay_step_counts_are_reported_per_action(monkeypatch):
+    """A smoke probe needs a positive signal that the skip actually fired."""
+    _patch_pp(monkeypatch, 3)
+    runner = _relay_step_runner()
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"p0": 8})
+    received = IntermediateTensors({"hidden_states": torch.ones(5, 2)})
+    NPUModelRunner._execute_layered_relay_step(
+        runner, scheduler_output, "forward", received, fused=True
+    )
+    NPUModelRunner._execute_layered_relay_step(
+        runner, scheduler_output, "forward", received, fused=True
+    )
+    _patch_pp(monkeypatch, 0)
+    runner.layered_prefill_model_adapter = SimpleNamespace(
+        make_transport_frontier=lambda n, dtype, device: (
+            torch.zeros(n, 4), torch.zeros(n, 4)
+        ),
+        to_intermediate_tensors=lambda out: IntermediateTensors(
+            {"hidden_states": out.hidden_states, "residual": out.residual}
+        ),
+    )
+    runner.model_config = SimpleNamespace(dtype=torch.float16)
+    runner.device = torch.device("cpu")
+    NPUModelRunner._execute_layered_relay_step(
+        runner, scheduler_output, "empty", None, fused=True
+    )
+    counters = runner.layered_prefill_counters
+    assert counters["relay_forward_steps"] == 2
+    assert counters["relay_empty_steps"] == 1
+
+
+def test_relay_step_on_the_last_rank_returns_no_tensors(monkeypatch):
+    _patch_pp(monkeypatch, 3)
+    runner = _relay_step_runner(is_last=True)
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"p0": 8})
+    assert (
+        NPUModelRunner._execute_layered_relay_step(
+            runner, scheduler_output, "forward", None, fused=True
+        )
+        is None
+    )
+    assert runner._layered_relay_output.req_ids == ["p0"]
+
+
+def test_relay_step_rejects_a_missing_activation(monkeypatch):
+    _patch_pp(monkeypatch, 3)
+    runner = _relay_step_runner()
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"p0": 8})
+    with pytest.raises(RuntimeError, match="no activation to pass on"):
+        NPUModelRunner._execute_layered_relay_step(
+            runner, scheduler_output, "forward", None, fused=True
+        )
+
+
+def _placeholder_runner():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.layered_prefill_model_adapter = SimpleNamespace(
+        make_transport_frontier=lambda n, dtype, device: (
+            torch.zeros(n, 4), torch.zeros(n, 4)
+        ),
+        to_intermediate_tensors=lambda out: IntermediateTensors(
+            {"hidden_states": out.hidden_states, "residual": out.residual}
+        ),
+    )
+    runner.model_config = SimpleNamespace(dtype=torch.float16)
+    runner.device = torch.device("cpu")
+    return runner
+
+
+def test_relay_placeholder_unpacks_off_the_fused_path():
+    """What the PP=4 smoke caught: the next stage still unpacks a placeholder.
+
+    Off the fused path a stage runs its payload through
+    _split_layered_pp_intermediate even when it goes on to restore its own
+    stored frontier, and that insists on the D/P row counts.  A placeholder
+    without them killed the worker mid-run.
+    """
+    runner = _placeholder_runner()
+
+    packed = NPUModelRunner._layered_pre_owner_placeholder(
+        runner, with_row_metadata=True
+    )
+    d_part, p_part = NPUModelRunner._split_layered_pp_intermediate(packed)
+    assert d_part.tensors["hidden_states"].shape[0] == 0
+    assert p_part.tensors["hidden_states"].shape[0] == 0
+
+
+def test_relay_placeholder_stays_bare_on_the_fused_path():
+    """The fused receiver feeds the payload to the model, so no extra keys."""
+    runner = _placeholder_runner()
+    packed = NPUModelRunner._layered_pre_owner_placeholder(runner)
+    assert set(packed.tensors) == {"hidden_states", "residual"}
+
+
+def test_sample_tokens_consumes_the_relay_output_once():
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    stashed = ModelRunnerOutput(
+        req_ids=["p0"],
+        req_id_to_index={"p0": 0},
+        sampled_token_ids=[[]],
+    )
+    runner._layered_relay_output = stashed
+    runner.execute_model_state = None
+    assert NPUModelRunner.sample_tokens(runner) is stashed
+    assert runner._layered_relay_output is None

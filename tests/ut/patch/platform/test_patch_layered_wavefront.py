@@ -89,6 +89,8 @@ def test_extensions_parse_and_default():
     ext = LayeredPrefillExtensions.from_vllm_config(_vllm_config(max_concurrent_layered_prefills=4))
     assert ext.max_concurrent_layered_prefills == 4
     assert LayeredPrefillExtensions.from_vllm_config(SimpleNamespace(additional_config=None)).max_concurrent_layered_prefills == 1
+    assert LayeredPrefillExtensions().skip_relay_stages is False
+    assert LayeredPrefillExtensions({"skip_relay_stages": True}).skip_relay_stages is True
 
 
 def test_extensions_reject_negative_concurrency():

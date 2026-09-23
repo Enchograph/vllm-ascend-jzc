@@ -49,6 +49,7 @@ from vllm.v1.worker.gpu.model_runner import (
 from vllm.v1.core.layered_prefill import (
     LayeredPrefillStateStore,
     LayeredForwardOutput,
+    make_pp_aligned_layer_group_ranges,
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
@@ -185,11 +186,18 @@ class NPUModelRunner(GPUModelRunner):
         self._layered_prefill_enabled = bool(layered_cfg.enabled)
         self._fuse_mixed_batch = bool(getattr(layered_cfg, "fuse_mixed_batch", False))
         self._same_layer_batch = bool(getattr(layered_cfg, "same_layer_batch", False))
+        layered_ext = getattr(
+            self.ascend_config.scheduler_config, "layered_prefill_extensions", None
+        )
+        self._skip_relay_stages = bool(getattr(layered_ext, "skip_relay_stages", False))
         # True after load_model wires the D→P adapter (PP=1 and PP>1).
         self._layered_prefill_v2_ready = False
         self.layered_prefill_state = LayeredPrefillStateStore()
         self.layered_prefill_model_adapter = None
         self._layered_skip_pp_decode_update = False
+        # Set when a step is pure relay, so sample_tokens can answer without
+        # an ExecuteModelState.
+        self._layered_relay_output: ModelRunnerOutput | None = None
         self._layered_input_buffers: AscendInputBuffers | None = None
         self.layered_prefill_counters = empty_layered_prefill_counters()
         if self._layered_prefill_enabled:
@@ -406,10 +414,19 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "same_layer_batch and fuse_mixed_batch cannot run together"
             )
+        # A stage with no work in this layer group relays it instead of
+        # running the runner machinery.  Decided before the activation is
+        # unpacked, so a stage ahead of the owner does not wait for a payload
+        # it will never read.  The D/P-split path is excluded: it carries two
+        # payloads, and relaying one of them needs its own reasoning.
+        relay_action = None
+        if use_pp and (fuse_mixed or not d_req_ids):
+            relay_action = self._layered_relay_stage_action(layered_plan)
+
         mixed_intermediate = None
         d_intermediate = None
         p_intermediate = None
-        if use_pp and not self.is_first_pp_rank:
+        if use_pp and not self.is_first_pp_rank and relay_action is None:
             if fuse_mixed:
                 mixed_intermediate = intermediate_tensors
                 if mixed_intermediate is None:
@@ -477,6 +494,14 @@ class NPUModelRunner(GPUModelRunner):
                     p_req_ids,
                 )
 
+            if relay_action is not None:
+                return self._execute_layered_relay_step(
+                    scheduler_output,
+                    relay_action,
+                    intermediate_tensors,
+                    fused=fuse_mixed,
+                )
+
             if fuse_mixed:
                 mixed_output = self._strip_lifecycle_fields(scheduler_output)
                 with self._layered_p_buffers():
@@ -498,10 +523,8 @@ class NPUModelRunner(GPUModelRunner):
                     fused_mixed=True,
                 )
                 if use_pp and not self.is_last_pp_rank:
-                    packed = (
-                        self.layered_prefill_model_adapter.to_intermediate_tensors(
-                            p_layered_output
-                        )
+                    packed = self._layered_fused_pp_payload(
+                        layered_plan, p_layered_output
                     )
                     packed.kv_connector_output = getattr(
                         p_layered_output, "kv_connector_output", None
@@ -879,6 +902,9 @@ class NPUModelRunner(GPUModelRunner):
             "transport_frontier_steps": int(
                 counters.get("transport_frontier_steps") or 0
             ),
+            "skip_relay_stages": bool(getattr(self, "_skip_relay_stages", False)),
+            "relay_empty_steps": int(counters.get("relay_empty_steps") or 0),
+            "relay_forward_steps": int(counters.get("relay_forward_steps") or 0),
             "groups": list(counters["groups"]),
             "pp_slots": list(counters["pp_slots"]),
             "activation_sources": list(counters.get("activation_sources") or []),
@@ -909,6 +935,187 @@ class NPUModelRunner(GPUModelRunner):
             self.req_states.num_computed_tokens_cpu[req_index] = int(
                 self.req_states.num_computed_tokens_np[req_index]
             )
+
+    def _layered_relay_stage_action(self, layered_plan) -> str | None:
+        """How this stage should relay the active layer group, if at all.
+
+        Returns ``"empty"`` for a stage ahead of the group owner,
+        ``"forward"`` for one behind it, and None when the stage has real
+        work.  A relay stage computes no layer (the adapter's local range is
+        empty) and writes no KV, because the layers it owns belong to groups
+        that already ran.
+
+        Real work means owning the active group, or owning the *next* one:
+        ``store_req_frontiers`` tags its result ``group_id + 1``, so the
+        frontier has to be left on ``owner_of(group_id + 1)``.  Everyone else
+        keeps nothing anyone will read -- a stage ahead of the owner stays
+        ahead for the rest of the chunk, since the owner index never
+        decreases.
+
+        Four carve-outs:
+
+        * The sampling step.  There the last rank broadcasts sampled tokens
+          and every other rank has to be inside ``sample_tokens`` to receive
+          them, or its request state diverges.  On every other step
+          ``LayeredPPHandlerCapture.flush`` drops a P-only payload without
+          broadcasting, so there is nothing to miss.
+        * The final layer group, even when it does not sample (the last group
+          of a non-final token chunk).  That step clears the request's stored
+          frontier on every rank, and a rank that skipped the clear would
+          still be holding one when the next chunk opens at group 0 -- which
+          ``_layered_prefill_activation_source`` rejects outright.
+        * ``dp_size > 1``.  ``dispatch_cg_and_sync_dp`` is a collective and
+          must not be desynchronised.  Layered already rejects DP > 1; this
+          keeps the reason local to the skip.
+        * A KV connector.  Without one the executor collects a
+          ``ModelRunnerOutput`` from the last PP stage only
+          (``_get_output_rank``).  With one it aggregates every rank, and the
+          skipped ``kv_connector.post_forward`` would be missed.  Layered
+          already rejects connectors; same reasoning, kept local.
+        """
+        if not self._skip_relay_stages:
+            return None
+        if self.parallel_config.pipeline_parallel_size <= 1:
+            return None
+        if self.dp_size > 1:
+            return None
+        if self.vllm_config.kv_transfer_config is not None:
+            return None
+        if getattr(
+            layered_plan, "is_sampling_step", layered_plan.is_final_group
+        ):
+            return None
+        if layered_plan.is_final_group:
+            return None
+        rank = get_pp_group().rank_in_group
+        owner = self._layered_pp_group_owner(layered_plan)
+        if rank == owner:
+            return None
+        if rank == self._layered_next_group_owner(layered_plan):
+            return None
+        return "empty" if rank < owner else "forward"
+
+    def _layered_next_group_owner(self, layered_plan) -> int | None:
+        """PP rank owning the group after this one, or None if it is last.
+
+        ``store_req_frontiers`` stamps its result with ``group_id + 1``, so
+        that rank is the one stage besides the current owner which has to run
+        the step for its stored frontier.
+        """
+        num_groups = int(layered_plan.num_groups)
+        next_group = int(layered_plan.group_id) + 1
+        if next_group >= num_groups:
+            return None
+        num_layers = self._num_hidden_layers()
+        pp_size = self.parallel_config.pipeline_parallel_size
+        layer_range = make_pp_aligned_layer_group_ranges(
+            num_layers, num_groups, pp_size
+        )[next_group]
+        for rank in range(pp_size):
+            start, end = get_pp_indices(num_layers, rank, pp_size)
+            if start <= layer_range.start and layer_range.end <= end:
+                return rank
+        return None
+
+    def _execute_layered_relay_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        action: str,
+        received,
+        *,
+        fused: bool,
+    ):
+        """Hand the activation on without touching the layer group.
+
+        ``sample_tokens`` still owes ``scheduler.update_from_output`` a row
+        per scheduled request even though nothing sampled, so stash that
+        output rather than leaving the state empty.
+        """
+        counters = self._layered_counters()
+        key = f"relay_{action}_steps"
+        counters[key] = int(counters.get(key) or 0) + 1
+        logger.info(
+            "Layered Prefill V2 relay action=%s pp_rank=%s empty=%s forward=%s",
+            action,
+            get_pp_group().rank_in_group,
+            counters["relay_empty_steps"],
+            counters["relay_forward_steps"],
+        )
+        self.execute_model_state = None
+        req_ids = list(scheduler_output.num_scheduled_tokens)
+        self._layered_relay_output = ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={
+                req_id: index for index, req_id in enumerate(req_ids)
+            },
+            sampled_token_ids=[[] for _ in req_ids],
+        )
+        if self.is_last_pp_rank:
+            return None
+        if action == "empty":
+            return self._layered_pre_owner_placeholder(with_row_metadata=not fused)
+        if received is None:
+            raise RuntimeError("Layered relay stage has no activation to pass on")
+        # Accessing ``.tensors`` on an AsyncIntermediateTensors waits for the
+        # recv, so the worker's isend cannot race the incoming transfer.
+        return received
+
+    def _layered_pre_owner_placeholder(
+        self, *, with_row_metadata: bool = False
+    ) -> IntermediateTensors:
+        """Zero-row payload standing in for a skipped layer group.
+
+        Same contract as the sliced payload in ``_layered_fused_pp_payload``:
+        no stage reads a pre-owner activation, and an empty tensor makes both
+        ends of the ring skip the transfer while still exchanging metadata.
+
+        Off the fused path the receiver runs its payload through
+        ``_split_layered_pp_intermediate``, which insists on the D/P row
+        counts even when it goes on to discard the rows -- the owner of a
+        group past the first restores its own stored frontier instead
+        (``activation_sources`` records it as ``frontier``).  Carry zeroed
+        counts there so the unpack has something to read.
+        """
+        adapter = self.layered_prefill_model_adapter
+        assert adapter is not None
+        hidden, residual = adapter.make_transport_frontier(
+            0, self.model_config.dtype, self.device
+        )
+        packed = adapter.to_intermediate_tensors(
+            LayeredForwardOutput(hidden, residual, False)
+        )
+        if with_row_metadata:
+            packed.tensors["layered_pp_d_rows"] = torch.tensor(0, dtype=torch.int64)
+            packed.tensors["layered_pp_p_rows"] = torch.tensor(0, dtype=torch.int64)
+        return packed
+
+    def _layered_fused_pp_payload(
+        self, layered_plan, output
+    ) -> IntermediateTensors:
+        """Pack a fused layer-group result for the next PP stage.
+
+        Stages before the group owner hold an activation that nobody reads:
+        the owner restores its own stored frontier and every earlier stage
+        rebuilds its own ``make_transport_frontier`` placeholder.  Send zero
+        rows there.  The receiver sizes its buffer from the sender's tensor
+        metadata and skips the transfer entirely for an empty tensor, so the
+        send/recv pair stays matched without moving a full-length
+        activation -- 268 MB per hop at a 32k prompt.
+
+        Only the fused payload is all-P.  The serial D->P path also carries
+        decode rows that every stage really does need, so it keeps sending
+        the full payload.
+        """
+        packed = self.layered_prefill_model_adapter.to_intermediate_tensors(
+            output
+        )
+        if get_pp_group().rank_in_group >= self._layered_pp_group_owner(
+            layered_plan
+        ):
+            return packed
+        return IntermediateTensors(
+            {key: value[:0] for key, value in packed.tensors.items()}
+        )
 
     def _layered_pp_group_owner(self, plan) -> int:
         pp = get_pp_group()
@@ -1454,6 +1661,12 @@ class NPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output=None):
+        relay_output = self._layered_relay_output
+        if relay_output is not None:
+            # This stage only passed the activation on.  Nothing sampled, but
+            # every scheduled request still needs a row in the output.
+            self._layered_relay_output = None
+            return relay_output
         state = self.execute_model_state
         if isinstance(state, LayeredV2ExecuteModelState):
             return self._sample_layered_v2(grammar_output, state)
