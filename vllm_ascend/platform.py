@@ -836,6 +836,16 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
 
     layered_prefill_config = scheduler_extension_config.layered_prefill_config
     if layered_prefill_config.enabled:
+        max_chunk_tokens = int(getattr(layered_prefill_config, "max_chunk_tokens", 0) or 0)
+        if max_chunk_tokens > 0:
+            batched = int(vllm_config.scheduler_config.max_num_batched_tokens)
+            if batched > max_chunk_tokens:
+                logger.info(
+                    "Layered prefill caps max_num_batched_tokens from %s to %s",
+                    batched,
+                    max_chunk_tokens,
+                )
+                vllm_config.scheduler_config.max_num_batched_tokens = max_chunk_tokens
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
         kv_transfer_config = vllm_config.kv_transfer_config
