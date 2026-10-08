@@ -17,6 +17,11 @@ import torch
 from vllm.v1.core.layered_prefill import LayeredFrontier, LayeredPrefillStateStore
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState
+from vllm.v1.worker.gpu.pp_utils import (
+    RingStepPlan,
+    align_sampled_payload,
+    ring_collective_action,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.layered_prefill import LayeredPrefillPlan
@@ -54,6 +59,8 @@ class LayeredV2ExecuteModelState:
     p_state: ExecuteModelState | None
     sample_p: bool
     fused_mixed: bool = False
+    # Requests whose logits must be dropped when the prompt chunk is not done.
+    prefill_req_ids: tuple[str, ...] = ()
 
 
 def detach_execute_model_state(state: ExecuteModelState) -> ExecuteModelState:
@@ -334,15 +341,95 @@ def _pp_flush_stats(
     }
 
 
-def _pad_sampled_tokens(tokens: torch.Tensor, width: int) -> torch.Tensor:
-    if tokens.ndim == 1:
-        tokens = tokens.unsqueeze(1)
-    if tokens.shape[1] == width:
-        return tokens
-    if tokens.shape[1] > width:
-        return tokens[:, :width]
-    pad = tokens.new_full((tokens.shape[0], width - tokens.shape[1]), -1)
-    return torch.cat((tokens, pad), dim=1)
+def _batch_covering_plan(batches, plan: RingStepPlan):
+    """One batch whose rows are exactly ``plan.sampled_request_order``."""
+    selected = _select_pp_batches(batches, plan.sampled_request_order)
+    by_id = {req_id: index for index, req_id in enumerate(selected.req_ids)}
+
+    def _take(name: str, fill: int) -> np.ndarray:
+        out = np.full(plan.payload_rows, fill, dtype=np.int64)
+        for row, req_id in enumerate(plan.sampled_request_order):
+            index = by_id.get(req_id)
+            if index is None:
+                continue
+            out[row] = int(getattr(selected, name)[index])
+        return out
+
+    idx = np.full(plan.payload_rows, -1, dtype=np.int32)
+    for row, req_id in enumerate(plan.sampled_request_order):
+        index = by_id.get(req_id)
+        if index is not None:
+            idx[row] = int(selected.idx_mapping_np[index])
+    return SimpleNamespace(
+        req_ids=list(plan.sampled_request_order),
+        num_reqs=plan.payload_rows,
+        num_computed_tokens_np=_take("num_computed_tokens_np", 0),
+        prefill_len_np=_take("prefill_len_np", 0),
+        max_seq_len_np=_take("max_seq_len_np", 0),
+        num_scheduled_tokens=_take("num_scheduled_tokens", 0),
+        idx_mapping=torch.tensor(idx, dtype=torch.int32),
+        idx_mapping_np=idx,
+    )
+
+
+def _empty_pp_batch(plan: RingStepPlan):
+    """Batch with no local rows. The collective shape still comes from ``plan``."""
+    return SimpleNamespace(
+        req_ids=[],
+        num_reqs=0,
+        num_computed_tokens_np=np.zeros(0, dtype=np.int64),
+        prefill_len_np=np.zeros(0, dtype=np.int64),
+        max_seq_len_np=np.zeros(0, dtype=np.int64),
+        num_scheduled_tokens=np.zeros(0, dtype=np.int64),
+        idx_mapping=torch.zeros(0, dtype=torch.int32),
+        idx_mapping_np=np.zeros(0, dtype=np.int32),
+    )
+
+
+def _select_pp_batches(batches, request_order: Sequence[str]):
+    """Rows named by the plan, in plan order. Extra captured ids are omitted."""
+    found: dict[str, tuple] = {}
+    for batch in batches:
+        ids = list(batch.req_ids)[: batch.num_reqs]
+        for index, req_id in enumerate(ids):
+            found[req_id] = (batch, index)
+    chosen = [req_id for req_id in request_order if req_id in found]
+    if not chosen:
+        return SimpleNamespace(
+            req_ids=[],
+            num_reqs=0,
+            num_computed_tokens_np=np.zeros(0, dtype=np.int64),
+            prefill_len_np=np.zeros(0, dtype=np.int64),
+            max_seq_len_np=np.zeros(0, dtype=np.int64),
+            num_scheduled_tokens=np.zeros(0, dtype=np.int64),
+            idx_mapping=torch.zeros(0, dtype=torch.int32),
+            idx_mapping_np=np.zeros(0, dtype=np.int32),
+        )
+
+    def _col(name: str) -> np.ndarray:
+        parts = []
+        for req_id in chosen:
+            batch, index = found[req_id]
+            parts.append(np.array(getattr(batch, name)[index], copy=True))
+        return np.stack(parts)
+
+    idx = torch.tensor(
+        [
+            int(found[req_id][0].idx_mapping[found[req_id][1]])
+            for req_id in chosen
+        ],
+        dtype=torch.int32,
+    )
+    return SimpleNamespace(
+        req_ids=chosen,
+        num_reqs=len(chosen),
+        num_computed_tokens_np=_col("num_computed_tokens_np"),
+        prefill_len_np=_col("prefill_len_np"),
+        max_seq_len_np=_col("max_seq_len_np"),
+        num_scheduled_tokens=_col("num_scheduled_tokens"),
+        idx_mapping=idx,
+        idx_mapping_np=idx.numpy().astype(np.int32, copy=True),
+    )
 
 
 class LayeredPPHandlerCapture:
@@ -395,64 +482,115 @@ class LayeredPPHandlerCapture:
         *,
         sample_p: bool,
         p_req_ids: set[str] | frozenset[str] | None = None,
+        plan: RingStepPlan | None = None,
     ) -> dict[str, Any]:
+        """Enter or skip the sampled-token collective from ``plan`` only.
+
+        ``sample_p`` is recorded for diagnostics. It does not drop rows and
+        it does not decide participation. An empty local capture still
+        enters when the plan says so, with empty rows for requests this
+        rank did not sample.
+        """
+        del sample_p  # participation is the plan's, not this flag's
         p_ids = set(p_req_ids or ())
         inner = self.inner
-        if getattr(inner, "is_last_rank", False):
-            dropped = [
-                payload
-                for payload in self.broadcasts
-                if not sample_p and _is_p_only_batch(payload[3], p_ids)
-            ]
-            payloads = [
-                payload
-                for payload in self.broadcasts
-                if sample_p or not _is_p_only_batch(payload[3], p_ids)
-            ]
-            stats = _pp_flush_stats(
-                role="broadcast",
-                sample_p=sample_p,
-                kept=[payload[3] for payload in payloads],
-                dropped=[payload[3] for payload in dropped],
-                p_ids=p_ids,
+        if plan is None:
+            plan = getattr(inner, "ring_step_plan", None)
+        action = ring_collective_action(plan)
+        if action == "missing":
+            raise RuntimeError(
+                "Layered PP flush has no RingStepPlan; refusing to skip "
+                "the sampled-token collective from the local batch"
             )
-            if not payloads:
-                return stats
-            width = int(getattr(inner, "max_sample_len", payloads[0][0].shape[-1] or 1))
-            tokens = torch.cat(
-                [_pad_sampled_tokens(payload[0], width) for payload in payloads],
-                dim=0,
-            )
-            num_sampled = torch.cat([payload[1] for payload in payloads], dim=0)
-            num_rejected = torch.cat([payload[2] for payload in payloads], dim=0)
-            inner.broadcast(
-                tokens,
-                num_sampled,
-                num_rejected,
-                concat_pp_input_batches([payload[3] for payload in payloads]),
-            )
-            return stats
-        dropped = [
-            batch
-            for batch in self.receives
-            if not sample_p and _is_p_only_batch(batch, p_ids)
-        ]
-        batches = [
-            batch
-            for batch in self.receives
-            if sample_p or not _is_p_only_batch(batch, p_ids)
+        assert plan is not None
+        if hasattr(inner, "bind_plan"):
+            inner.bind_plan(plan)
+        else:
+            inner.ring_step_plan = plan
+        role = "broadcast" if getattr(inner, "is_last_rank", False) else "receive"
+        captured = (
+            [payload[3] for payload in self.broadcasts]
+            if role == "broadcast"
+            else list(self.receives)
+        )
+        extra = [
+            req_id
+            for batch in captured
+            for req_id in list(batch.req_ids)[: batch.num_reqs]
+            if req_id not in plan.sampled_request_order
         ]
         stats = _pp_flush_stats(
-            role="receive",
-            sample_p=sample_p,
-            kept=batches,
-            dropped=dropped,
+            role=role,
+            sample_p=bool(getattr(plan, "collective_required", False)),
+            kept=captured,
+            dropped=[],
             p_ids=p_ids,
         )
-        if not batches:
+        stats.update(
+            step_id=plan.step_id,
+            plan_hash=plan.plan_hash,
+            participated=action == "enter",
+            skipped=action != "enter",
+            payload_rows=plan.payload_rows,
+            sample_width=plan.sample_width,
+            req_ids=list(plan.sampled_request_order),
+            dropped_not_in_plan=len(extra),
+            dropped_p_rows=0,
+            dropped_d_rows=0,
+        )
+        if action == "skip":
+            note = getattr(inner, "record_ring_skip", None)
+            if note is not None:
+                note(role)
             return stats
-        inner.receive(concat_pp_input_batches(batches))
+        if role == "broadcast":
+            self._flush_broadcast(plan)
+        else:
+            self._flush_receive(plan)
         return stats
+
+    def _flush_broadcast(self, plan: RingStepPlan) -> None:
+        req_ids: list[str] = []
+        token_rows: list[torch.Tensor] = []
+        sampled_rows: list[torch.Tensor] = []
+        rejected_rows: list[torch.Tensor] = []
+        batches = []
+        for tokens, sampled, rejected, batch in self.broadcasts:
+            ids = list(batch.req_ids)[: batch.num_reqs]
+            req_ids.extend(ids)
+            token_rows.append(tokens[: len(ids)])
+            sampled_rows.append(sampled[: len(ids)])
+            rejected_rows.append(rejected[: len(ids)])
+            batches.append(batch)
+        if token_rows:
+            tokens = torch.cat(token_rows, dim=0)
+            num_sampled = torch.cat(sampled_rows, dim=0)
+            num_rejected = torch.cat(rejected_rows, dim=0)
+        else:
+            tokens = torch.empty(
+                (0, plan.sample_width), dtype=torch.int64
+            )
+            num_sampled = torch.empty(0, dtype=torch.int32)
+            num_rejected = torch.empty(0, dtype=torch.int32)
+        aligned_tokens, aligned_sampled, aligned_rejected = align_sampled_payload(
+            plan, req_ids, tokens, num_sampled, num_rejected
+        )
+        # Token row i belongs to plan order i. The handler aligns again by
+        # req id, so this batch must name every plan row in that order.
+        # Otherwise a second align would treat the already-aligned tensor
+        # as if it were still in capture order.
+        ordered = _batch_covering_plan(batches, plan)
+        self.inner.broadcast(
+            aligned_tokens, aligned_sampled, aligned_rejected, ordered
+        )
+
+    def _flush_receive(self, plan: RingStepPlan) -> None:
+        ordered = (
+            _select_pp_batches(self.receives, plan.sampled_request_order)
+            if self.receives
+            else _empty_pp_batch(plan)
+        )
+        self.inner.receive(ordered)
 
 
 def concat_req_frontiers(
@@ -489,8 +627,10 @@ def concat_req_frontiers(
             )
         if has_residual:
             residual_parts.append(frontier.residual)
-    hidden = torch.cat(hidden_parts, dim=0)
-    residual = torch.cat(residual_parts, dim=0) if residual_mode else None
+    from vllm_ascend.ops.pack_fused_stage import pack_token_rows
+
+    hidden = pack_token_rows(hidden_parts)
+    residual = pack_token_rows(residual_parts) if residual_mode else None
     pad = int(num_tokens_padded) - int(hidden.shape[0])
     if pad < 0:
         raise RuntimeError(
@@ -501,6 +641,27 @@ def concat_req_frontiers(
         if residual is not None:
             residual = _pad_token_rows(residual, pad)
     return hidden, residual
+
+
+def _persist_frontier_rows(
+    tensor: torch.Tensor,
+    start: int,
+    end: int,
+    *,
+    take_storage: bool,
+) -> torch.Tensor:
+    """Own logical rows for a frontier entry.
+
+    When one request owns the entire activation tensor, take it with
+    ``contiguous()`` (zero-copy if already contiguous) so store does not
+    allocate a second full copy beside the forward output. Partial slices
+    always ``clone()``: a narrow view would keep the parent storage (and any
+    trailing pad) alive, and ``contiguous()`` on a contiguous prefix does
+    not detach.
+    """
+    if take_storage and start == 0 and end == int(tensor.shape[0]):
+        return tensor.contiguous()
+    return tensor[start:end].clone()
 
 
 def store_req_frontiers(
@@ -519,17 +680,22 @@ def store_req_frontiers(
     ``query_start_loc`` is always aligned to ``batch_req_ids`` (or ``req_ids``
     when that is the full batch). ``keep_ids`` persists a subset without
     treating subset order as loc indices.
+
+    Drops any previous frontier for a request before allocating the new one
+    so the old copy does not overlap the handover peak.
     """
     loc_ids = list(batch_req_ids) if batch_req_ids is not None else list(req_ids)
     persist = list(keep_ids) if keep_ids is not None else list(req_ids)
     id_to_index = {req_id: index for index, req_id in enumerate(loc_ids)}
-    last_id = loc_ids[-1] if loc_ids else None
     total_rows = int(hidden_states.shape[0])
     if residual is not None and int(residual.shape[0]) != total_rows:
         raise RuntimeError(
             "Layered frontier hidden and residual row counts differ: "
             f"hidden_rows={total_rows} residual_rows={int(residual.shape[0])}"
         )
+    # One request owning every row can take the activation storage; mixed
+    # or padded batches must copy logical slices only.
+    take_storage = len(persist) == 1
     for req_id in persist:
         if req_id not in id_to_index:
             raise RuntimeError(
@@ -542,19 +708,34 @@ def store_req_frontiers(
             raise RuntimeError(
                 f"Layered mixed frontier has empty rows for request {req_id}"
             )
-        # Sequence-parallel / DSA-CP padding is appended after the last
-        # logical token and is already computed by this group. Keep it on
-        # the last request so the next group restores the physical width.
-        # query_len stays the logical token count.
-        row_end = total_rows if req_id == last_id and total_rows > end else end
+        if end > total_rows:
+            raise RuntimeError(
+                f"Layered frontier slice for {req_id} ends at {end}, "
+                f"past hidden rows {total_rows}"
+            )
+        # Drop the previous group before allocating/taking the new tensor.
+        store.pop(req_id)
+        # Padding (sequence-parallel / DSA-CP) sits after the last logical
+        # token of this physical batch. It belongs to the batch width, not
+        # to whichever request happens to be last. A later group may drop a
+        # Decode rider and pad to a different width; carrying the old pad
+        # rows on the last request makes the restored row count disagree
+        # with the new query_start_loc. Persist logical rows only.
+        # concat_req_frontiers pads to the current batch width.
         store.put(
             LayeredFrontier(
                 req_id=req_id,
                 group_id=next_group_id,
                 query_len=end - start,
-                hidden_states=hidden_states[start:row_end].clone(),
+                hidden_states=_persist_frontier_rows(
+                    hidden_states, start, end, take_storage=take_storage
+                ),
                 residual=(
-                    None if residual is None else residual[start:row_end].clone()
+                    None
+                    if residual is None
+                    else _persist_frontier_rows(
+                        residual, start, end, take_storage=take_storage
+                    )
                 ),
             )
         )
@@ -580,13 +761,23 @@ def slice_req_activations(
             raise RuntimeError(
                 f"Layered activation slice is empty for request {req_id}"
             )
-        hidden_parts.append(hidden_states[start:end].clone())
+        # Views only; a single part uses contiguous(), multiple parts rely on
+        # cat to allocate once instead of clone-then-cat.
+        hidden_parts.append(hidden_states[start:end])
         if residual is not None:
-            residual_parts.append(residual[start:end].clone())
+            residual_parts.append(residual[start:end])
     if not hidden_parts:
         raise RuntimeError("Layered activation slice matched no requests")
-    hidden = torch.cat(hidden_parts, dim=0)
-    residual_out = torch.cat(residual_parts, dim=0) if residual_parts else None
+    if len(hidden_parts) == 1:
+        hidden = hidden_parts[0].contiguous()
+        residual_out = (
+            None if not residual_parts else residual_parts[0].contiguous()
+        )
+    else:
+        hidden = torch.cat(hidden_parts, dim=0)
+        residual_out = (
+            torch.cat(residual_parts, dim=0) if residual_parts else None
+        )
     return hidden, residual_out
 
 

@@ -9,7 +9,7 @@ import torch
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.worker.gpu.pp_utils import compute_need_sampled_mask
+from vllm.v1.worker.gpu.pp_utils import build_ring_step_plan, compute_need_sampled_mask
 
 from vllm_ascend.worker.v2.layered_prefill import (
     LayeredPPHandlerCapture,
@@ -251,7 +251,18 @@ def test_capture_flush_merges_d_and_final_p_broadcast():
         p_batch,
     )
     d_tokens.fill_(0)
-    stats = capture.flush(sample_p=True, p_req_ids={"p0"})
+    plan = build_ring_step_plan(
+        step_id=1,
+        pp_size=4,
+        sample_width=2,
+        request_order=["d0", "d1", "p0"],
+        old_computed={"d0": 8, "d1": 8, "p0": 0},
+        num_scheduled={"d0": 1, "d1": 1, "p0": 16},
+        prefill_len={"d0": 8, "d1": 8, "p0": 16},
+        max_seq_len={"d0": 64, "d1": 64, "p0": 64},
+        sampling_step=True,
+    )
+    stats = capture.flush(sample_p=True, p_req_ids={"p0"}, plan=plan)
 
     assert len(inner.broadcasts) == 1
     tokens, num_sampled, _rejected, batch = inner.broadcasts[0]
@@ -265,9 +276,23 @@ def test_capture_flush_merges_d_and_final_p_broadcast():
     assert stats["skipped"] is False
 
 
-def test_capture_flush_drops_intermediate_p_from_receive():
-    inner = _FakePPHandler(is_last_rank=False, max_sample_len=1)
-    capture = LayeredPPHandlerCapture(inner)
+def test_capture_flush_skips_intermediate_group_on_both_sides():
+    """A non-sampling plan skips the collective even if a Decode row was captured.
+
+    Dropping only the P batch and still receiving D is a local decision.
+    The other rank can skip entirely and the receive hangs.
+    """
+    plan = build_ring_step_plan(
+        step_id=2,
+        pp_size=4,
+        sample_width=1,
+        request_order=["d0", "p0"],
+        old_computed={"d0": 8, "p0": 0},
+        num_scheduled={"d0": 1, "p0": 16},
+        prefill_len={"d0": 8, "p0": 16},
+        max_seq_len={"d0": 64, "p0": 64},
+        sampling_step=False,
+    )
     d_batch = _pp_batch(
         ["d0"],
         computed=[8],
@@ -284,16 +309,30 @@ def test_capture_flush_drops_intermediate_p_from_receive():
         max_seq=[64],
         req_indices=[1],
     )
-    assert capture.receive(d_batch) is False
-    assert capture.receive(p_batch) is False
-    stats = capture.flush(sample_p=False, p_req_ids={"p0"})
 
-    assert len(inner.receives) == 1
-    assert inner.receives[0].req_ids == ["d0"]
-    assert stats["n_d"] == 1
-    assert stats["n_p"] == 0
-    assert stats["dropped_p_rows"] == 1
-    assert stats["skipped"] is False
+    sender = _FakePPHandler(is_last_rank=True, max_sample_len=1)
+    send_capture = LayeredPPHandlerCapture(sender)
+    send_capture.broadcast(
+        torch.tensor([[7]], dtype=torch.int64),
+        torch.ones(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        d_batch,
+    )
+    send_stats = send_capture.flush(sample_p=False, p_req_ids={"p0"}, plan=plan)
+
+    receiver = _FakePPHandler(is_last_rank=False, max_sample_len=1)
+    recv_capture = LayeredPPHandlerCapture(receiver)
+    assert recv_capture.receive(d_batch) is False
+    assert recv_capture.receive(p_batch) is False
+    recv_stats = recv_capture.flush(sample_p=False, p_req_ids={"p0"}, plan=plan)
+
+    assert sender.broadcasts == []
+    assert receiver.receives == []
+    assert send_stats["participated"] is False
+    assert recv_stats["participated"] is False
+    assert send_stats["plan_hash"] == recv_stats["plan_hash"] == plan.plan_hash
+    assert send_stats["req_ids"] == recv_stats["req_ids"] == ["d0", "p0"]
+    assert send_stats["skipped"] is True and recv_stats["skipped"] is True
 
 
 def test_sample_layered_v2_merges_d_and_final_p_on_non_last_rank(monkeypatch):
@@ -357,6 +396,17 @@ def test_sample_layered_v2_merges_d_and_final_p_on_non_last_rank(monkeypatch):
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            ring_step_plan=build_ring_step_plan(
+                step_id=3,
+                pp_size=4,
+                sample_width=1,
+                request_order=["d0", "p0"],
+                old_computed={"d0": 8, "p0": 0},
+                num_scheduled={"d0": 1, "p0": 16},
+                prefill_len={"d0": 8, "p0": 16},
+                max_seq_len={"d0": 64, "p0": 64},
+                sampling_step=True,
+            ),
         ),
         d_state=SimpleNamespace(input_batch=d_batch),
         p_state=SimpleNamespace(input_batch=p_batch, finished_req_ids=set()),
@@ -424,6 +474,17 @@ def test_sample_layered_v2_skips_pp_slot_for_intermediate_p(monkeypatch):
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            ring_step_plan=build_ring_step_plan(
+                step_id=4,
+                pp_size=4,
+                sample_width=1,
+                request_order=["d0", "p0"],
+                old_computed={"d0": 8, "p0": 0},
+                num_scheduled={"d0": 1, "p0": 16},
+                prefill_len={"d0": 8, "p0": 16},
+                max_seq_len={"d0": 64, "p0": 64},
+                sampling_step=False,
+            ),
         ),
         d_state=SimpleNamespace(input_batch=d_batch),
         p_state=SimpleNamespace(input_batch=p_batch, finished_req_ids=set()),
@@ -432,8 +493,7 @@ def test_sample_layered_v2_skips_pp_slot_for_intermediate_p(monkeypatch):
 
     output = runner._sample_layered_v2(None, state)
     assert sample_calls == [["d0"]]
-    assert len(inner.receives) == 1
-    assert inner.receives[0].req_ids == ["d0"]
+    assert inner.receives == []
     assert output.sampled_token_ids == [[7], []]
 
 
@@ -534,6 +594,28 @@ def test_prepare_p_activation_owner_uses_local_frontier(monkeypatch):
     assert embeds is None
     assert inter is None
     assert frontier[0] is not dummy_h
+
+
+def test_prepare_p_activation_owner_pads_short_frontier(monkeypatch):
+    leftover = SimpleNamespace(
+        group_id=2,
+        hidden_states=torch.full((3, 4), 1.5),
+        residual=torch.full((3, 4), 2.5),
+    )
+    runner, plan, _h, _r = _pp4_activation_runner(monkeypatch, rank=2, leftover=leftover)
+    _req_id, frontier, embeds, inter, source = runner._prepare_layered_p_activation(
+        plan,
+        num_tokens_padded=8,
+        inputs_embeds=torch.ones(3, 4),
+        intermediate_tensors=None,
+    )
+    assert source == "frontier"
+    assert tuple(frontier[0].shape) == (8, 4)
+    assert tuple(frontier[1].shape) == (8, 4)
+    assert torch.equal(frontier[0][:3], leftover.hidden_states)
+    assert torch.equal(frontier[1][:3], leftover.residual)
+    assert embeds is None
+    assert inter is None
 
 
 def test_prepare_p_activation_owner_missing_frontier_raises(monkeypatch):

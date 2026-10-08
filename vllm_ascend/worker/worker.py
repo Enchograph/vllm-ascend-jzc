@@ -20,6 +20,8 @@
 import copy
 import gc
 import logging
+import os
+import time
 from types import NoneType
 from typing import Any
 
@@ -566,6 +568,14 @@ class NPUWorker(WorkerBase):
                     factor,
                 )
 
+        frontier_extra = int(getattr(self.model_runner, "layered_frontier_profile_bytes", 0) or 0)
+        if frontier_extra:
+            self.available_kv_cache_memory_bytes -= frontier_extra
+            logger.info(
+                "Layered Prefill frontier subtracted from KV budget: %.2f GiB",
+                GiB(frontier_extra),
+            )
+
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
@@ -666,7 +676,27 @@ class NPUWorker(WorkerBase):
                 getattr(self.model_runner, "_layered_prefill_v2_ready", None),
             )
 
+        trace_chunk = (
+            os.environ.get("VLLM_PP_CHUNK_TIMELINE") == "1" and forward_pass
+        )
+        trace_t0 = time.perf_counter() if trace_chunk else 0.0
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        if trace_chunk and any(
+            n > 1 for n in scheduler_output.num_scheduled_tokens.values()
+        ):
+            self._pp_chunk_trace_step = getattr(self, "_pp_chunk_trace_step", 0) + 1
+            logger.info(
+                "pp_chunk_timeline rank=%s step=%s tokens=%s ids=%s t0=%.6f t1=%.6f",
+                get_pp_group().rank_in_group,
+                self._pp_chunk_trace_step,
+                scheduler_output.total_num_scheduled_tokens,
+                ",".join(
+                    f"{req_id}:{n}"
+                    for req_id, n in scheduler_output.num_scheduled_tokens.items()
+                ),
+                trace_t0,
+                time.perf_counter(),
+            )
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 

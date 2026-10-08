@@ -189,6 +189,10 @@ class NPUModelRunner(GPUModelRunner):
         self._layered_prefill_v2_ready = False
         self.layered_prefill_state = LayeredPrefillStateStore()
         self.layered_prefill_model_adapter = None
+        # Bytes of the cross-group frontier that profile's high-water mark
+        # did not already include. Subtracted from the KV budget in
+        # NPUWorker.determine_available_memory.
+        self.layered_frontier_profile_bytes = 0
         self._layered_skip_pp_decode_update = False
         self._layered_input_buffers: AscendInputBuffers | None = None
         self.layered_prefill_counters = empty_layered_prefill_counters()
@@ -377,6 +381,10 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "The loaded model does not have a layered prefill adapter"
             )
+        if self.pp_handler is not None:
+            self.pp_handler.bind_plan(
+                getattr(scheduler_output, "ring_step_plan", None)
+            )
 
         use_pp = self.parallel_config.pipeline_parallel_size > 1
         if not use_pp and intermediate_tensors is not None:
@@ -465,9 +473,9 @@ class NPUModelRunner(GPUModelRunner):
             # is normally refreshed in prepare_inputs only for
             # scheduled_cached_reqs rows; D/P sub-batches strip those fields
             # to avoid double update_requests, so sync explicitly here.
-            self._sync_ascend_num_computed_tokens_cpu(
-                list(scheduler_output.num_scheduled_tokens)
-            )
+            scheduled_ids = list(scheduler_output.num_scheduled_tokens)
+            self._sync_ascend_num_computed_tokens_cpu(scheduled_ids)
+            self._sync_gpu_num_computed_tokens(scheduled_ids)
 
             if same_layer:
                 return self._execute_same_layer_d_complete(
@@ -496,6 +504,7 @@ class NPUModelRunner(GPUModelRunner):
                         )
                     ),
                     fused_mixed=True,
+                    prefill_req_ids=tuple(p_req_ids),
                 )
                 if use_pp and not self.is_last_pp_rank:
                     packed = (
@@ -503,6 +512,7 @@ class NPUModelRunner(GPUModelRunner):
                             p_layered_output
                         )
                     )
+                    packed = self._pack_fused_stage_activation(packed)
                     packed.kv_connector_output = getattr(
                         p_layered_output, "kv_connector_output", None
                     )
@@ -910,6 +920,75 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens_np[req_index]
             )
 
+    def _sync_gpu_num_computed_tokens(self, req_ids: list[str]) -> None:
+        """Copy the scheduler cursor onto the GPU seq_len source.
+
+        ``update_requests`` writes ``num_computed_tokens_np`` only. Non-sampling
+        token chunks skip ``postprocess``, so the GPU cursor stays at the first
+        chunk. The last chunk then looks like ``seq_len < prefill_len`` and the
+        sampler drops the first decode token.
+        """
+        staged = False
+        for req_id in req_ids:
+            req_index = self.req_states.req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            self.req_states.num_computed_tokens.stage_write_elem(
+                req_index, int(self.req_states.num_computed_tokens_np[req_index])
+            )
+            staged = True
+        if staged:
+            self.req_states.num_computed_tokens.apply_write()
+
+    @staticmethod
+    def _mask_fused_prefill_broadcast(capture, prefill_req_ids: tuple[str, ...]) -> None:
+        """Do not ship a mid-chunk prefill token across the PP sample slot."""
+        drop = set(prefill_req_ids)
+        if not drop:
+            return
+        for tokens, num_sampled, _rejected, snapshot in capture.broadcasts:
+            for index, req_id in enumerate(snapshot.req_ids):
+                if req_id not in drop:
+                    continue
+                if index < tokens.shape[0]:
+                    tokens[index].zero_()
+                if num_sampled is not None and index < num_sampled.shape[0]:
+                    num_sampled[index] = 0
+
+    @staticmethod
+    def _drop_prefill_sampled_tokens(output, prefill_req_ids: tuple[str, ...]):
+        """Keep decode tokens; a non-final prefill chunk has no logit yet."""
+        if not prefill_req_ids or not output.sampled_token_ids:
+            return output
+        drop = set(prefill_req_ids)
+        sampled = [list(row) for row in output.sampled_token_ids]
+        for req_id in drop:
+            index = output.req_id_to_index.get(req_id)
+            if index is None or index >= len(sampled):
+                continue
+            sampled[index] = []
+        output.sampled_token_ids = sampled
+        return output
+
+    def _pack_fused_stage_activation(self, packed: IntermediateTensors) -> IntermediateTensors:
+        """Rewrite the outgoing fused activation with the stage pack op.
+
+        The batch is already one tensor. Splitting it in half and packing the
+        halves back keeps row order, and the next rank receives a buffer the
+        custom kernel wrote.
+        """
+        from vllm_ascend.ops.pack_fused_stage import pack_token_rows
+
+        for key in ("hidden_states", "residual"):
+            value = packed.tensors.get(key) if hasattr(packed, "tensors") else None
+            if not isinstance(value, torch.Tensor) or value.ndim < 2 or value.shape[0] < 2:
+                continue
+            mid = int(value.shape[0] // 2)
+            if mid <= 0 or mid >= value.shape[0]:
+                continue
+            packed.tensors[key] = pack_token_rows([value[:mid], value[mid:]])
+        return packed
+
     def _layered_pp_group_owner(self, plan) -> int:
         pp = get_pp_group()
         configs = (
@@ -923,6 +1002,9 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(raw_num_layers, int):
                 num_layers = int(raw_num_layers)
                 break
+        if int(plan.group_start) == 0 and int(plan.group_end) >= num_layers:
+            # Full-model range: every rank runs its own stage inside this step.
+            return -1
         for rank in range(pp.world_size):
             start, end = get_pp_indices(num_layers, rank, pp.world_size)
             if start <= plan.group_start and plan.group_end <= end:
@@ -1064,6 +1146,17 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError("Layered Prefill activation has no request ids")
         pp = get_pp_group()
         owner = self._layered_pp_group_owner(layered_plan)
+        if owner < 0:
+            # The plan covers every stage. Rank 0 embeds; later ranks consume
+            # the activation the previous stage just sent.
+            if pp.rank_in_group == 0 and layered_plan.group_id == 0:
+                return req_ids, None, inputs_embeds, None, "embed"
+            if intermediate_tensors is None:
+                raise RuntimeError(
+                    "Layered PP stage did not receive activation for a "
+                    "full-model fused step"
+                )
+            return req_ids, None, None, intermediate_tensors, "pp_recv"
         owner_has_frontier = layered_plan.group_id > 0 and pp.rank_in_group == owner
         if owner_has_frontier:
             if len(req_ids) > 1:
@@ -1099,9 +1192,16 @@ class NPUModelRunner(GPUModelRunner):
                     frontier.query_len,
                     num_tokens_padded,
                 )
+            # Stored rows are logical only. DSA-CP / SP pads the live batch
+            # (for example 4005 -> 4008). Multi-request restore pads inside
+            # concat_req_frontiers; a single request must pad here too.
             return (
                 req_ids,
-                (frontier.hidden_states, frontier.residual),
+                pad_activation_rows(
+                    frontier.hidden_states,
+                    frontier.residual,
+                    num_tokens_padded,
+                ),
                 None,
                 None,
                 "frontier",
@@ -1382,6 +1482,22 @@ class NPUModelRunner(GPUModelRunner):
                 intermediate_tensors=p_pp_intermediate,
             )
 
+        mem_after = int(torch.npu.memory_allocated(self.device))
+        peak_after = int(
+            torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
+        )
+        logger.info(
+            "Layered Prefill mem group=%s/%s source=%s logical=%s padded=%s "
+            "allocated=%s peak=%s",
+            layered_plan.group_id,
+            layered_plan.num_groups,
+            activation_source,
+            num_toks,
+            num_tokens_padded,
+            mem_after,
+            peak_after,
+        )
+
         actual_rows = int(layered_output.hidden_states.shape[0])
         if actual_rows != num_tokens_padded:
             raise RuntimeError(
@@ -1492,8 +1608,19 @@ class NPUModelRunner(GPUModelRunner):
                         # PPHandler slot stay in lockstep.  Capture merges D ∪ P
                         # into one broadcast/receive (V6).
                         # fused_mixed: p_state is the combined D+P batch.
+                        # On a non-final prompt chunk the prefill rows have no
+                        # logits yet; keep the decode tokens and drop those rows.
+                        # The final chunk does sample, including any Decode
+                        # rider in the fused batch, so the grammar bitmask has
+                        # to reach this call.
                         self.execute_model_state = state.p_state
-                        output = super().sample_tokens(None)
+                        active_grammar = grammar_output
+                        if grammar_output is not None and not any(
+                            req_id in grammar_output.structured_output_request_ids
+                            for req_id in state.p_state.input_batch.req_ids
+                        ):
+                            active_grammar = None
+                        output = super().sample_tokens(active_grammar)
                         if isinstance(output, AsyncOutput):
                             output = output.get_output()
                         if output is None:
@@ -1527,7 +1654,9 @@ class NPUModelRunner(GPUModelRunner):
                 self.execute_model_state = None
             if capture is not None:
                 slot = capture.flush(
-                    sample_p=state.sample_p, p_req_ids=set(p_req_ids)
+                    sample_p=state.sample_p,
+                    p_req_ids=set(p_req_ids),
+                    plan=getattr(state.scheduler_output, "ring_step_plan", None),
                 )
                 self._record_layered_pp_slot(slot)
 
@@ -1582,6 +1711,76 @@ class NPUModelRunner(GPUModelRunner):
             routed_experts=None,
         )
 
+    def _profile_layered_frontier_budget(self) -> None:
+        """Reserve peak for one full-width cross-group frontier.
+
+        Startup ``profile_run`` uses dummy forward and never enters the
+        layered store/restore path, so without this allocation the KV pool
+        is sized as if the frontier did not exist. Shape matches the live
+        DeepSeek-V4 ``[T, hc_mult, H]`` frontier (no residual) or the
+        standard ``[T, H]`` + residual pair.
+        """
+        self.layered_frontier_profile_bytes = 0
+        if not self._layered_prefill_enabled:
+            return
+        from vllm_ascend.models.layered_prefill import (
+            DeepseekV4LayeredPrefillAdapter,
+        )
+
+        adapter = self.layered_prefill_model_adapter
+        hidden_size = int(self.model_config.get_hidden_size())
+        hc_mult = 1
+        reserve_residual = True
+        if isinstance(adapter, DeepseekV4LayeredPrefillAdapter):
+            hc_mult = int(adapter.backbone.hc_mult)
+            reserve_residual = False
+        elif adapter is not None:
+            backbone = getattr(adapter, "backbone", None)
+            if backbone is not None and hasattr(backbone, "hc_mult"):
+                hc_mult = int(backbone.hc_mult)
+        if hc_mult > 1:
+            shape: tuple[int, ...] = (
+                int(self.max_num_tokens),
+                hc_mult,
+                hidden_size,
+            )
+        else:
+            shape = (int(self.max_num_tokens), hidden_size)
+        peak_before = int(
+            torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
+        )
+        frontier = torch.empty(shape, dtype=self.dtype, device=self.device)
+        residual = (
+            torch.empty(shape, dtype=self.dtype, device=self.device)
+            if reserve_residual
+            else None
+        )
+        torch.npu.synchronize()
+        bytes_reserved = frontier.numel() * frontier.element_size()
+        if residual is not None:
+            bytes_reserved += residual.numel() * residual.element_size()
+        peak_after = int(
+            torch.npu.memory_stats(self.device).get("allocated_bytes.all.peak", 0)
+        )
+        # Profile frees the dummy forward before this allocation, so the
+        # high-water mark is max(forward, frontier), not their sum. The live
+        # path keeps the frontier while the next group forwards, so subtract
+        # the part of ``bytes_reserved`` that did not raise the peak.
+        peak_included = max(0, peak_after - peak_before)
+        extra = max(0, bytes_reserved - peak_included)
+        self.layered_frontier_profile_bytes = extra
+        logger.info(
+            "Layered Prefill profile frontier budget shape=%s residual=%s "
+            "bytes=%s peak_included=%s extra=%s",
+            shape,
+            residual is not None,
+            bytes_reserved,
+            peak_included,
+            extra,
+        )
+        del frontier
+        del residual
+
     @torch.inference_mode()
     def profile_run(self) -> None:
         """Override GPUModelRunner.profile_run for Ascend NPUs.
@@ -1599,6 +1798,7 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
             super().profile_run()
+            self._profile_layered_frontier_budget()
 
     if vllm_version_is("0.27.1"):
 
