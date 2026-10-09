@@ -96,6 +96,29 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Diagnostic only. "1" logs a per-step memory balance sheet at the layered
+    # Decode->Prefill handover (allocator retries, allocated/peak/reserved,
+    # free device memory, and the bytes held by the cross-group frontier
+    # store). Query-only: it never allocates device memory. Default "0".
+    "VLLM_ASCEND_LAYERED_MEM_PROBE": lambda: bool(int(os.getenv("VLLM_ASCEND_LAYERED_MEM_PROBE", "0"))),
+    # Diagnostic only. "1" additionally appends the allocator segment table to
+    # /tmp/memprobe_segments_rank<N>.jsonl at each probe point, so a kernel
+    # fault address can be matched against live segments. Heavier than the
+    # balance sheet; requires VLLM_ASCEND_LAYERED_MEM_PROBE=1. Default "0".
+    "VLLM_ASCEND_LAYERED_MEM_PROBE_SNAPSHOT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_LAYERED_MEM_PROBE_SNAPSHOT", "0"))
+    ),
+    # Diagnostic only. "1" logs the arguments handed to the sparse-attention
+    # kernel (block table shape and per-row block-id stats, seq lens, query
+    # start locations) for the first few steps. Read-only: no device
+    # allocation and no bulk device->host copies. Default "0".
+    "VLLM_ASCEND_DSA_ARG_PROBE": lambda: bool(int(os.getenv("VLLM_ASCEND_DSA_ARG_PROBE", "0"))),
+    # Diagnostic only. "1" logs, on every step, the addresses of the tensors
+    # fed into attention metadata, tagged capture vs replay. Used to check
+    # whether an address baked into a captured aclgraph still holds when that
+    # graph is replayed. Reads data_ptr() only: no allocation, no copies.
+    # Default "0".
+    "VLLM_ASCEND_GRAPH_ADDR_PROBE": lambda: bool(int(os.getenv("VLLM_ASCEND_GRAPH_ADDR_PROBE", "0"))),
 }
 
 # end-env-vars-definition

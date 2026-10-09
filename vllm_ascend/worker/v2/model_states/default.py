@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.worker.v2 import _graph_addr_probe
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 
@@ -90,5 +91,15 @@ class AscendModelState(DefaultModelState):
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
             for_cudagraph_capture=for_capture,
+        )
+        # Runs outside the graph, so it reports on replay steps too -- unlike
+        # a probe at the kernel call site, which graph replay never executes.
+        _graph_addr_probe.record_step_addrs(
+            input_batch=input_batch,
+            block_tables=block_tables,
+            for_capture=for_capture,
+            cudagraph_mode=cudagraph_mode,
+            num_reqs=input_batch.num_reqs,
+            num_reqs_padded=num_reqs,
         )
         return self.attn_metadata

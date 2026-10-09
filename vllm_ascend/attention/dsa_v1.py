@@ -1589,4 +1589,20 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 assert compress_topk_idxs is not None
                 attn_kwargs["cmp_sparse_indices"] = compress_topk_idxs
 
+        # Imported here, not at module scope: this module already sits in an
+        # import cycle with device_op, and a diagnostic must not perturb the
+        # import order of the code it observes.
+        from vllm_ascend.attention import _dsa_arg_probe
+
+        _dsa_arg_probe.record_sparse_attn_args(
+            layer_name=layer_name,
+            block_table=attn_kwargs.get("ori_block_table"),
+            seqused_kv=attn_kwargs.get("seqused_kv"),
+            cu_seqlens_q=attn_kwargs.get("cu_seqlens_q"),
+            query=q,
+            ori_win_left=attn_kwargs.get("ori_win_left"),
+            has_prefill=has_prefill,
+            sparse_indices=attn_kwargs.get("ori_sparse_indices"),
+            cmp_block_table=attn_kwargs.get("cmp_block_table"),
+        )
         return attn_op(q, **attn_kwargs)[0]

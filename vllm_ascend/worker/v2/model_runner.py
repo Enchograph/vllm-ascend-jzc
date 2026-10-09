@@ -82,6 +82,7 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_tokens_capacity,
 )
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+from vllm_ascend.worker.v2 import _mem_probe as mem_probe
 from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_sp,
@@ -565,9 +566,14 @@ class NPUModelRunner(GPUModelRunner):
                     raise RuntimeError(
                         "Layered Prefill V2 D sub-batch returned an unexpected output"
                     )
+                mem_probe.record(mem_probe.PROBE_TAG_DECODE_END, self)
                 if p_req_ids:
                     # P reuses model activation scratch; keep D logits inputs alive.
                     d_state = detach_execute_model_state(d_state)
+                    # Record before the synchronize: this is the point the
+                    # MML=10240 layered run faults on, and the driver only
+                    # surfaces an earlier kernel fault once we sync here.
+                    mem_probe.record(mem_probe.PROBE_TAG_HANDOVER, self)
                     # Establish a stream boundary before P may pick a different
                     # MoE backend / attention workspace.
                     torch.npu.synchronize()
@@ -586,6 +592,7 @@ class NPUModelRunner(GPUModelRunner):
                         p_output, layered_plan, p_intermediate
                     )
                 torch.npu.synchronize()
+                mem_probe.record(mem_probe.PROBE_TAG_PREFILL_END, self)
                 if use_pp and not self.is_last_pp_rank:
                     assert p_layered_output is not None
                     pp_intermediates.append(
