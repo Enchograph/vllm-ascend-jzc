@@ -16,7 +16,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 
 import numpy as np
 import torch
@@ -25,6 +25,26 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import vllm_version_is
+
+
+def _field_values(input_batch: InputBatch) -> dict:
+    """Field values of ``input_batch``, by reference.
+
+    ``dataclasses.asdict`` must not be used here. Its leaf branch is
+    ``copy.deepcopy(obj)``, and ``torch.Tensor.__deepcopy__`` allocates new
+    storage, so every tensor field comes back detached from the buffer it was
+    sliced from.
+
+    ``InputBatch.make_dummy`` deliberately returns slices of the persistent
+    ``InputBuffers`` (``input_buffers.seq_lens[:num_reqs]`` and friends) so that
+    the address an aclgraph bakes at capture is the same address the runtime
+    writes to on every replay. Copying the tensors breaks that invariant: the
+    captured graph reads a throwaway allocation that nothing ever updates
+    again. Backends whose ``update_graph_params`` rebinds the kernel arguments
+    hide the damage; DSA's is a no-op, so it reads stale lengths and derives
+    out-of-range KV addresses from them.
+    """
+    return {f.name: getattr(input_batch, f.name) for f in fields(input_batch)}
 
 
 class AscendInputBuffers(InputBuffers):
@@ -101,7 +121,7 @@ class AscendInputBatch(InputBatch):
             seq_lens_np = input_buffers.seq_lens_np[:num_reqs]
             update_cos_sin(input_batch.positions)
             return cls(
-                **asdict(input_batch),
+                **_field_values(input_batch),
                 seq_lens_np=seq_lens_np,
                 attn_state=AscendAttentionState.DecodeOnly,
             )
@@ -131,7 +151,7 @@ class AscendInputBatch(InputBatch):
             seq_lens_np = input_buffers.seq_lens_np[:num_reqs]
             update_cos_sin(input_batch.positions)
             return cls(
-                **asdict(input_batch),
+                **_field_values(input_batch),
                 seq_lens_np=seq_lens_np,
                 attn_state=AscendAttentionState.DecodeOnly,
             )
