@@ -69,5 +69,11 @@ import vllm_ascend.patch.worker.patch_v2.patch_eagle_speculator  # noqa
 import vllm_ascend.patch.worker.patch_v2.patch_dflash_speculator  # noqa
 import vllm_ascend.patch.worker.patch_v2.patch_dspark  # noqa
 
+# The pp_broadcast HCCL communicator allocates its buffer lazily on first use,
+# which is after memory profiling has already sized the KV cache. Materialize it
+# while PPHandler is being constructed so the cost is charged, not discovered at
+# the first mixed step.
+import vllm_ascend.patch.worker.patch_v2.patch_pp_broadcast_buffer  # noqa
+
 # only patch routed experts capture in main2main.
 import vllm_ascend.patch.worker.patch_routed_experts_capture  # noqa

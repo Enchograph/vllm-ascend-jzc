@@ -806,15 +806,19 @@ class NPUWorker(WorkerBase):
         if not self.model_config.enforce_eager:
             npugraph_memory_bytes = self.model_runner.capture_model()
 
-        # Suggest an optimal --kv-cache-memory value for future runs.
+        # Suggest an optimal --kv-cache-memory-bytes value for future runs.
         # Only emitted when we ran full profiling (kv_cache_memory_bytes was not
         # pre-specified) so that peak_activation_memory etc. are available.
         # non_kv_memory already includes NPU graph memory, so the suggestion
-        # accounts for all measured memory categories. A 150 MiB buffer is kept
-        # because memory_profiling may slightly underestimate non-torch
-        # allocations (ACL context, HCCL buffers, driver layer, etc.).
+        # accounts for all measured memory categories. The 150 MiB buffer below
+        # shrinks only this *suggestion*; the budget actually used for the KV
+        # cache is computed in determine_available_memory() and does not carry
+        # it. Note it does not cover the pp_broadcast HCCL communicator either:
+        # that buffer is materialized while PPHandler is constructed (see
+        # vllm_ascend/patch/worker/patch_v2/patch_pp_broadcast_buffer.py) so it
+        # lands in non_torch_memory like any other driver-side allocation.
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(self, "peak_activation_memory"):
-            redundancy_buffer = 150 * (1 << 20)  # 150 MiB safety margin
+            redundancy_buffer = 150 * (1 << 20)  # 150 MiB, suggestion-only margin
             non_kv_memory = (
                 self.model_runner.model_memory_usage
                 + self.peak_activation_memory
